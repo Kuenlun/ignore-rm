@@ -263,3 +263,163 @@ pub fn collect_ignored_paths<'a>(
 
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    // Assert that `discover_topmost(path)` returns exactly `expected`
+    fn assert_finds_topmost(path: &Path, expected: &Repository) {
+        let found = discover_topmost(path).expect("discover_topmost failed");
+        assert_eq!(
+            found.working_dir(),
+            expected.working_dir(),
+            "working_dir mismatch for {:?}: got {:?}, want {:?}",
+            path,
+            found.working_dir(),
+            expected.working_dir(),
+        );
+        assert_eq!(
+            found.path(),
+            expected.path(),
+            "repo path mismatch for {:?}: got {:?}, want {:?}",
+            path,
+            found.path(),
+            expected.path(),
+        );
+    }
+
+    // Test that discovering from the repo root returns the repo itself
+    #[test]
+    fn discover_topmost_from_root_returns_root() -> Result<(), PickerError> {
+        // 1. Create a temp dir
+        let temp = tempdir()?;
+        let root = temp.path();
+        // 2. Init a repo at the root
+        let top_repo = Repository::init(&root)?;
+        // 3. Assert discover_topmost(root) == top_repo
+        assert_finds_topmost(&root, &top_repo);
+        Ok(())
+    }
+
+    // Test that discovering from a repo subdirectory returns the repo itself
+    #[test]
+    fn discover_topmost_from_subdirectory_returns_root() -> Result<(), PickerError> {
+        // 1. Create a temp dir
+        let temp = tempdir()?;
+        let root = temp.path();
+        // 2. Init a repo at the root
+        let top_repo = Repository::init(&root)?;
+        // 3. Create a nested directory inside the repo
+        let sub_dir = root.join("a");
+        fs::create_dir_all(&sub_dir)?;
+        // 4. Assert discover_topmost(sub_dir) == top_repo
+        assert_finds_topmost(&sub_dir, &top_repo);
+        Ok(())
+    }
+
+    // Test that discovering from a repo nested subdirectory returns the repo itself
+    #[test]
+    fn discover_topmost_from_nested_subdirectory_returns_root() -> Result<(), PickerError> {
+        // 1. Create a temp dir
+        let temp = tempdir()?;
+        let root = temp.path();
+        // 2. Init a repo at the root
+        let top_repo = Repository::init(&root)?;
+        // 3. Create a nested directory inside the repo
+        let nested_sub_dir = root.join("a").join("b");
+        fs::create_dir_all(&nested_sub_dir)?;
+        // 4. Assert discover_topmost(nested_sub_dir) == top_repo
+        assert_finds_topmost(&nested_sub_dir, &top_repo);
+        Ok(())
+    }
+
+    #[test]
+    fn discover_topmost_from_sub_repo_returns_root() -> Result<(), PickerError> {
+        // 1. Create a temp dir
+        let temp = tempdir()?;
+        let root = temp.path();
+        // 2. Init a repo at the root
+        let top_repo = Repository::init(&root)?;
+        // 3. Create a nested directory inside the repo
+        let sub_dir = root.join("a");
+        fs::create_dir_all(&sub_dir)?;
+        // 4. Init a repo at the subdirectory
+        let sub_repo = Repository::init(&sub_dir)?;
+        // 5. Assert the sub repo directory is the same as the subdirectory
+        assert_eq!(sub_repo.working_dir(), &sub_dir);
+        // 6. Assert discover_topmost(sub_dir) == top_repo
+        assert_finds_topmost(&sub_dir, &top_repo);
+        Ok(())
+    }
+
+    #[test]
+    fn discover_topmost_from_nested_repo_in_sub_directory_returns_root() -> Result<(), PickerError>
+    {
+        // 1. Create a temp dir
+        let temp = tempdir()?;
+        let root = temp.path();
+        // 2. Init a repo at the root
+        let top_repo = Repository::init(&root)?;
+        // 3. Create a nested directory inside the repo
+        let nested_sub_dir = root.join("a").join("b");
+        fs::create_dir_all(&nested_sub_dir)?;
+        // 4. Init a repo at the nested subdirectory
+        let sub_repo = Repository::init(&nested_sub_dir)?;
+        // 5. Assert the sub repo directory is the same as the subdirectory
+        assert_eq!(sub_repo.working_dir(), &nested_sub_dir);
+        // 6. Assert discover_topmost(nested_sub_dir) == top_repo
+        assert_finds_topmost(&nested_sub_dir, &top_repo);
+        Ok(())
+    }
+
+    #[test]
+    fn discover_topmost_from_nested_sub_repo_returns_root() -> Result<(), PickerError> {
+        // 1. Create a temp dir
+        let temp = tempdir()?;
+        let root = temp.path();
+        // 2. Init a repo at the root
+        let top_repo = Repository::init(&root)?;
+        // 3. Create a subdirectory inside the repo
+        let sub_dir = root.join("a");
+        fs::create_dir_all(&sub_dir)?;
+        // 4. Create a nested directory inside the repo
+        let nested_sub_dir = sub_dir.join("b");
+        fs::create_dir_all(&nested_sub_dir)?;
+        // 5. Init a sub repo at the subdirectory
+        let sub_repo = Repository::init(&sub_dir)?;
+        // 6. Init a nested sub repo at the nested subdirectory
+        let nested_sub_repo = Repository::init(&nested_sub_dir)?;
+        // 7. Assert the sub repo directory is the same as the subdirectory
+        assert_eq!(sub_repo.working_dir(), &sub_dir);
+        // 8. Assert the nested sub repo directory is the same as the nested subdirectory
+        assert_eq!(nested_sub_repo.working_dir(), &nested_sub_dir);
+        // 9. Assert discover_topmost(nested_sub_dir) == top_repo
+        assert_finds_topmost(&nested_sub_dir, &top_repo);
+        Ok(())
+    }
+
+    #[test]
+    fn discovers_topmost_error_when_no_repo() -> Result<(), PickerError> {
+        // 1. Create a temporary empty directory
+        let temp = tempdir()?;
+        let root = temp.path();
+        // 2. Call the function and expect a specific Git2 error
+        let Err(PickerError::Git2(e)) = discover_topmost(&root) else {
+            panic!("expected Err(PickerError::Git2) with NotFound");
+        };
+        // 3. Check that libgit2 correctly identifies the error class and code
+        assert_eq!(
+            e.class(),
+            git2::ErrorClass::Repository,
+            "expected libgit2 error class Repository"
+        );
+        assert_eq!(
+            e.code(),
+            git2::ErrorCode::NotFound,
+            "expected libgit2 error code NotFound"
+        );
+        Ok(())
+    }
+}
