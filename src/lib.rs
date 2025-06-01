@@ -348,7 +348,10 @@ mod tests {
         // 4. Init a repo at the subdirectory
         let sub_repo = Repository::init(&sub_dir)?;
         // 5. Assert the sub repo directory is the same as the subdirectory
-        assert_eq!(sub_repo.working_dir(), &sub_dir);
+        assert_eq!(
+            sub_repo.working_dir().canonicalize()?,
+            sub_dir.canonicalize()?
+        );
         // 6. Assert discover_topmost(sub_dir) == top_repo
         assert_finds_topmost(&sub_dir, &top_repo);
         Ok(())
@@ -368,7 +371,10 @@ mod tests {
         // 4. Init a repo at the nested subdirectory
         let sub_repo = Repository::init(&nested_sub_dir)?;
         // 5. Assert the sub repo directory is the same as the subdirectory
-        assert_eq!(sub_repo.working_dir(), &nested_sub_dir);
+        assert_eq!(
+            sub_repo.working_dir().canonicalize()?,
+            nested_sub_dir.canonicalize()?
+        );
         // 6. Assert discover_topmost(nested_sub_dir) == top_repo
         assert_finds_topmost(&nested_sub_dir, &top_repo);
         Ok(())
@@ -392,9 +398,15 @@ mod tests {
         // 6. Init a nested sub repo at the nested subdirectory
         let nested_sub_repo = Repository::init(&nested_sub_dir)?;
         // 7. Assert the sub repo directory is the same as the subdirectory
-        assert_eq!(sub_repo.working_dir(), &sub_dir);
+        assert_eq!(
+            sub_repo.working_dir().canonicalize()?,
+            sub_dir.canonicalize()?
+        );
         // 8. Assert the nested sub repo directory is the same as the nested subdirectory
-        assert_eq!(nested_sub_repo.working_dir(), &nested_sub_dir);
+        assert_eq!(
+            nested_sub_repo.working_dir().canonicalize()?,
+            nested_sub_dir.canonicalize()?
+        );
         // 9. Assert discover_topmost(nested_sub_dir) == top_repo
         assert_finds_topmost(&nested_sub_dir, &top_repo);
         Ok(())
