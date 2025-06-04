@@ -268,34 +268,119 @@ pub fn collect_ignored_paths<'a>(
 mod tests {
     use super::*;
 
-    mod discover_topmost {
+    // ---------------------------------------------------------------------
+    // Helpers for tests
+    // ---------------------------------------------------------------------
+
+    /// Assert that two paths are equal after canonicalization
+    fn assert_same_path(p1: &Path, p2: &Path, context: &str) {
+        let err_msg = "failed to canonicalize";
+        let c1 = p1.canonicalize().expect(err_msg);
+        let c2 = p2.canonicalize().expect(err_msg);
+        assert_eq!(
+            c1, c2,
+            "{}: path mismatch\n  left:  {:?}\n  right: {:?}",
+            context, c1, c2
+        );
+    }
+
+    /// Initialize a repository and assert its working_dir matches the given path
+    fn init_repo_assert_path_matches(path: &Path) -> Repository {
+        let repo = Repository::init(path).expect("failed to init repo");
+        assert_same_path(repo.working_dir(), path, "init repo working_dir");
+        repo
+    }
+
+    /// Create a temporary Git repository and return the TempDir and Repository handle
+    fn init_repo_in_tempdir() -> (tempfile::TempDir, Repository) {
+        let temp = tempfile::tempdir().expect("failed to create tempdir");
+        let repo = init_repo_assert_path_matches(temp.path());
+        (temp, repo)
+    }
+
+    // ---------------------------------------------------------------------
+    // `collect_ignored_paths` tests
+    // ---------------------------------------------------------------------
+    mod collect_ignored_paths {
         use super::*;
-        use std::fs;
-        use std::path::Path;
-        use tempfile::tempdir;
+        use std::io::Write;
 
-        // ---------------------------------------------------------------------
-        // Helpers for `discover_topmost` tests
-        // ---------------------------------------------------------------------
+        /// Creates an empty `.gitignore` file in the given directory and returns its `PathBuf`.
+        fn create_empty_gitignore(repo: &Repository, dir: &Path) -> PathBuf {
+            let gitignore_path = dir.join(".gitignore");
+            fs::File::create(&gitignore_path).expect("Failed to create .gitignore file");
 
-        /// Assert that two paths are equal after canonicalization
-        fn assert_same_path(p1: &Path, p2: &Path, context: &str) {
-            let err_msg = "failed to canonicalize";
-            let c1 = p1.canonicalize().expect(err_msg);
-            let c2 = p2.canonicalize().expect(err_msg);
-            assert_eq!(
-                c1, c2,
-                "{}: path mismatch\n  left:  {:?}\n  right: {:?}",
-                context, c1, c2
+            // Ensure `.gitignore` itself is not ignored
+            assert!(
+                !repo.is_path_ignored(Path::new(".gitignore")).unwrap(),
+                ".gitignore should not be ignored"
+            );
+
+            gitignore_path
+        }
+
+        /// Creates a file named `file_name` inside `dir` and returns its full `PathBuf`.
+        fn create_file(dir: &Path, file_name: &str) -> PathBuf {
+            let full_path = dir.join(file_name);
+            fs::File::create(&full_path)
+                .unwrap_or_else(|_| panic!("Failed to create `{}`", full_path.display()));
+            full_path
+        }
+
+        /// Appends a pattern to the given `.gitignore` file.
+        fn add_to_gitignore(gitignore_path: &Path, pattern: &str) {
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(gitignore_path)
+                .expect("Failed to open .gitignore for appending");
+
+            writeln!(file, "{pattern}").expect("Failed to write to .gitignore");
+        }
+
+        /// Verifies that Git marks `file_path` as ignored (relative to repo root).
+        fn assert_ignored(repo: &Repository, file_path: &Path) {
+            let is_ignored = repo.is_path_ignored(file_path).unwrap_or_else(|_| {
+                panic!("Failed to check if `{}` is ignored", file_path.display())
+            });
+
+            assert!(
+                is_ignored,
+                "`{}` should be ignored according to .gitignore",
+                file_path.display()
             );
         }
 
-        /// Initialize a repository and assert its working_dir matches the given path
-        fn init_repo_assert_path_matches(path: &Path) -> Repository {
-            let repo = Repository::init(path).expect("failed to init repo");
-            assert_same_path(repo.working_dir(), path, "init repo working_dir");
-            repo
+        #[test]
+        fn detect_ignored_file() -> Result<(), PickerError> {
+            let (temp_dir, repo) = init_repo_in_tempdir();
+            let root = temp_dir.path();
+
+            // Create an empty `.gitignore` and ensure it isn’t ignored.
+            let gitignore_path = create_empty_gitignore(&repo, root);
+
+            // Create "ignored.txt", add it to `.gitignore`, and assert Git ignores it.
+            let ignored_path = create_file(root, "ignored.txt");
+            add_to_gitignore(&gitignore_path, "ignored.txt");
+            assert_ignored(&repo, &ignored_path);
+
+            // Collect ignored paths for "ignored.txt" and verify exactly one result.
+            let mut collected = Vec::new();
+            let ignored_paths =
+                collect_ignored_paths(&repo, Path::new("ignored.txt"), &mut collected)?;
+
+            assert_eq!(ignored_paths.len(), 1);
+            assert_eq!(ignored_paths[0], ignored_path);
+
+            Ok(())
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // `discover_topmost` tests
+    // ---------------------------------------------------------------------
+    mod discover_topmost {
+        use super::*;
+        use tempfile::tempdir;
 
         /// Assert that `discover_topmost(path)` returns the expected repository
         fn assert_finds_topmost(path: &Path, expected: &Repository) {
@@ -313,17 +398,6 @@ mod tests {
                 &format!("repo path for {:?}", path),
             );
         }
-
-        /// Create a temporary Git repository and return the TempDir and Repository handle
-        fn init_repo_in_tempdir() -> (tempfile::TempDir, Repository) {
-            let temp = tempfile::tempdir().expect("failed to create tempdir");
-            let repo = init_repo_assert_path_matches(temp.path());
-            (temp, repo)
-        }
-
-        // ---------------------------------------------------------------------
-        // `discover_topmost` tests
-        // ---------------------------------------------------------------------
 
         // Test that discovering from the repo root returns the repo itself
         #[test]
@@ -419,7 +493,7 @@ mod tests {
         }
 
         #[test]
-        fn discovers_topmost_error_when_no_repo() -> Result<(), PickerError> {
+        fn discover_topmost_error_when_no_repo() -> Result<(), PickerError> {
             let temp = tempdir()?;
             let root = temp.path();
 
