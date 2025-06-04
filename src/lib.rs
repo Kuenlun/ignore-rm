@@ -272,22 +272,22 @@ mod tests {
     // Helpers for tests
     // ---------------------------------------------------------------------
 
-    /// Assert that two paths are equal after canonicalization
-    fn assert_same_path(p1: &Path, p2: &Path, context: &str) {
+    /// Assert that two paths are equal after canonicalization.
+    fn assert_same_path(p1: &Path, p2: &Path) {
         let err_msg = "failed to canonicalize";
         let c1 = p1.canonicalize().expect(err_msg);
         let c2 = p2.canonicalize().expect(err_msg);
         assert_eq!(
             c1, c2,
-            "{}: path mismatch\n  left:  {:?}\n  right: {:?}",
-            context, c1, c2
+            "path mismatch\n  left:  {:?}\n  right: {:?}",
+            c1, c2
         );
     }
 
     /// Initialize a repository and assert its working_dir matches the given path
     fn init_repo_assert_path_matches(path: &Path) -> Repository {
         let repo = Repository::init(path).expect("failed to init repo");
-        assert_same_path(repo.working_dir(), path, "init repo working_dir");
+        assert_same_path(repo.working_dir(), path);
         repo
     }
 
@@ -369,7 +369,7 @@ mod tests {
                 collect_ignored_paths(&repo, Path::new("ignored.txt"), &mut collected)?;
 
             assert_eq!(ignored_paths.len(), 1);
-            assert_eq!(ignored_paths[0], ignored_path);
+            assert_same_path(&ignored_paths[0], &ignored_path);
 
             Ok(())
         }
@@ -382,21 +382,15 @@ mod tests {
         use super::*;
         use tempfile::tempdir;
 
-        /// Assert that `discover_topmost(path)` returns the expected repository
+        /// Assert that `discover_topmost(path)` returns the expected repository.
         fn assert_finds_topmost(path: &Path, expected: &Repository) {
             let found = discover_topmost(path).expect("discover_topmost failed");
 
-            assert_same_path(
-                found.working_dir(),
-                expected.working_dir(),
-                &format!("working_dir for {:?}", path),
-            );
+            // Compare working directories
+            assert_same_path(found.working_dir(), expected.working_dir());
 
-            assert_same_path(
-                found.path(),
-                expected.path(),
-                &format!("repo path for {:?}", path),
-            );
+            // Compare repository paths
+            assert_same_path(found.path(), expected.path());
         }
 
         // Test that discovering from the repo root returns the repo itself
