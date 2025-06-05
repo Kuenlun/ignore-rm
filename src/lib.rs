@@ -277,11 +277,7 @@ mod tests {
         let err_msg = "failed to canonicalize";
         let c1 = p1.canonicalize().expect(err_msg);
         let c2 = p2.canonicalize().expect(err_msg);
-        assert_eq!(
-            c1, c2,
-            "path mismatch\n  left:  {:?}\n  right: {:?}",
-            c1, c2
-        );
+        assert_eq!(c1, c2);
     }
 
     /// Initialize a repository and assert its working_dir matches the given path
@@ -419,7 +415,7 @@ mod tests {
 
         // -----------------------------------------------------------------
         // 3. When given a single file path, `collect_ignored_paths` should
-        //    return at most that file—even if there are other ignored files
+        //    return at most that file, even if there are other ignored files
         //    in the same folder.
         // -----------------------------------------------------------------
         #[test]
@@ -427,10 +423,10 @@ mod tests {
             let (temp_dir, repo) = init_repo_in_tempdir();
             let root = temp_dir.path();
 
-            // 1) Create and touch a ".gitignore"
+            // Create a ".gitignore"
             let gitignore = create_gitignore(&repo, root)?;
 
-            // 2) Create two files and add both to .gitignore
+            // Create two files and add both to .gitignore
             let ignored1 = create_file(root, "ignored.txt")?;
             let ignored2 = create_file(root, "ignored2.txt")?;
 
@@ -445,7 +441,7 @@ mod tests {
             assert_ignored(&repo, &ignored1);
             assert_ignored(&repo, &ignored2);
 
-            // 3) Now call collect_ignored_paths *only* on "ignored.txt"
+            // Now call collect_ignored_paths *only* on "ignored.txt"
             let mut collected = Vec::new();
             let result = collect_ignored_paths(&repo, Path::new("ignored.txt"), &mut collected)?;
 
@@ -456,6 +452,42 @@ mod tests {
                 "Expected only `ignored.txt` to be returned, even though ignored2.txt also exists"
             );
             assert_same_path(&result[0], &ignored1);
+
+            Ok(())
+        }
+
+        // ----------------------------------------------------------------------
+        // 4. Ignored directory -> only the ignored directory itself should be collected,
+        //    not its internal files.
+        // ----------------------------------------------------------------------
+        #[test]
+        fn ignored_directory_and_contents_are_collected() -> Result<(), PickerError> {
+            let (temp_dir, repo) = init_repo_in_tempdir();
+            let root = temp_dir.path();
+
+            // Create a ".gitignore"
+            let gitignore = create_gitignore(&repo, root)?;
+
+            // Create an ignored directory "ignored_dir" with a file inside
+            let ignored_dir = root.join("ignored_dir");
+            fs::create_dir(&ignored_dir)?;
+            let ignored_file = create_file(&ignored_dir, "file.txt")?;
+            assert_not_ignored(&repo, &ignored_file);
+            assert_not_ignored(&repo, &ignored_dir);
+
+            // Add the directory to .gitignore
+            append_to_gitignore(&gitignore, "ignored_dir/")?;
+            assert_ignored(&repo, &ignored_file);
+            assert_ignored(&repo, &ignored_dir);
+
+            // Collect ignored paths from the ignored directory
+            let mut collected = Vec::new();
+            let ignored_paths =
+                collect_ignored_paths(&repo, Path::new("ignored_dir"), &mut collected)?;
+
+            // The only collected path should be the directory
+            assert_eq!(ignored_paths.len(), 1);
+            assert_same_path(&ignored_paths[0], &ignored_dir);
 
             Ok(())
         }
