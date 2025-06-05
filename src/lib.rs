@@ -305,71 +305,157 @@ mod tests {
         use super::*;
         use std::io::Write;
 
-        /// Creates an empty `.gitignore` file in the given directory and returns its `PathBuf`.
-        fn create_empty_gitignore(repo: &Repository, dir: &Path) -> PathBuf {
+        // Creates an empty `.gitignore` file in `dir`, then asserts that Git does not ignore it.
+        fn create_gitignore(repo: &Repository, dir: &Path) -> Result<PathBuf, PickerError> {
             let gitignore_path = dir.join(".gitignore");
-            fs::File::create(&gitignore_path).expect("Failed to create .gitignore file");
+            fs::File::create(&gitignore_path)?;
 
-            // Ensure `.gitignore` itself is not ignored
+            // Ensure that Git is not already ignoring ".gitignore" itself
+            let is_ignored = repo.is_path_ignored(Path::new(".gitignore"))?;
+            assert!(!is_ignored, ".gitignore should not be ignored by default");
+
+            Ok(gitignore_path)
+        }
+
+        // Creates a file named `filename` inside `dir`. Returns its full PathBuf.
+        fn create_file(dir: &Path, filename: &str) -> Result<PathBuf, PickerError> {
+            let full_path = dir.join(filename);
+            fs::File::create(&full_path)?;
+            Ok(full_path)
+        }
+
+        // Appends exactly `pattern` (plus a newline) to the given `.gitignore` file.
+        fn append_to_gitignore(gitignore: &Path, pattern: &str) -> Result<(), PickerError> {
+            let mut file = fs::OpenOptions::new().append(true).open(gitignore)?;
+            writeln!(file, "{}", pattern)?;
+            Ok(())
+        }
+
+        // Panics if `path` is not ignored by Git.
+        fn assert_ignored(repo: &Repository, path: &Path) {
+            let ignored = repo
+                .is_path_ignored(path)
+                .unwrap_or_else(|e| panic!("Git error checking `{}`: {}", path.display(), e));
             assert!(
-                !repo.is_path_ignored(Path::new(".gitignore")).unwrap(),
-                ".gitignore should not be ignored"
-            );
-
-            gitignore_path
-        }
-
-        /// Creates a file named `file_name` inside `dir` and returns its full `PathBuf`.
-        fn create_file(dir: &Path, file_name: &str) -> PathBuf {
-            let full_path = dir.join(file_name);
-            fs::File::create(&full_path)
-                .unwrap_or_else(|_| panic!("Failed to create `{}`", full_path.display()));
-            full_path
-        }
-
-        /// Appends a pattern to the given `.gitignore` file.
-        fn add_to_gitignore(gitignore_path: &Path, pattern: &str) {
-            let mut file = fs::OpenOptions::new()
-                .append(true)
-                .open(gitignore_path)
-                .expect("Failed to open .gitignore for appending");
-
-            writeln!(file, "{pattern}").expect("Failed to write to .gitignore");
-        }
-
-        /// Verifies that Git marks `file_path` as ignored (relative to repo root).
-        fn assert_ignored(repo: &Repository, file_path: &Path) {
-            let is_ignored = repo.is_path_ignored(file_path).unwrap_or_else(|_| {
-                panic!("Failed to check if `{}` is ignored", file_path.display())
-            });
-
-            assert!(
-                is_ignored,
+                ignored,
                 "`{}` should be ignored according to .gitignore",
-                file_path.display()
+                path.display()
             );
         }
 
+        // Panics if `path` is ignored by Git.
+        fn assert_not_ignored(repo: &Repository, path: &Path) {
+            let ignored = repo
+                .is_path_ignored(path)
+                .unwrap_or_else(|e| panic!("Git error checking `{}`: {}", path.display(), e));
+            assert!(
+                !ignored,
+                "`{}` should NOT be ignored according to .gitignore",
+                path.display()
+            );
+        }
+
+        // ----------------------------------------------------------------------
+        // 1. No ignored-file at all -> `collect_ignored_paths` returns empty vec
+        // ----------------------------------------------------------------------
         #[test]
-        fn detect_ignored_file() -> Result<(), PickerError> {
+        fn no_ignored_file_returns_empty() -> Result<(), PickerError> {
             let (temp_dir, repo) = init_repo_in_tempdir();
             let root = temp_dir.path();
 
-            // Create an empty `.gitignore` and ensure it isn’t ignored.
-            let gitignore_path = create_empty_gitignore(&repo, root);
+            // Create a file "not_ignored.txt" at repo root
+            let not_ignored = create_file(root, "not_ignored.txt")?;
+            // Assert Git does not ignore it
+            assert_not_ignored(&repo, &not_ignored);
 
-            // Create "ignored.txt", add it to `.gitignore`, and assert Git ignores it.
-            let ignored_path = create_file(root, "ignored.txt");
-            add_to_gitignore(&gitignore_path, "ignored.txt");
-            assert_ignored(&repo, &ignored_path);
-
-            // Collect ignored paths for "ignored.txt" and verify exactly one result.
+            // Collect ignored paths from the entire repo ("" = root)
             let mut collected = Vec::new();
-            let ignored_paths =
-                collect_ignored_paths(&repo, Path::new("ignored.txt"), &mut collected)?;
+            let ignored_paths = collect_ignored_paths(&repo, Path::new(""), &mut collected)?;
 
-            assert_eq!(ignored_paths.len(), 1);
-            assert_same_path(&ignored_paths[0], &ignored_path);
+            // We expect zero ignored-paths
+            assert!(
+                ignored_paths.is_empty(),
+                "Expected no ignored paths, but found some: {:?}",
+                ignored_paths
+            );
+
+            Ok(())
+        }
+
+        // ------------------------------------------------------------------------
+        // 2. One ignored-file -> `collect_ignored_paths` returns exactly that file
+        // ------------------------------------------------------------------------
+        #[test]
+        fn single_ignored_file_is_detected() -> Result<(), PickerError> {
+            let (temp_dir, repo) = init_repo_in_tempdir();
+            let root = temp_dir.path();
+
+            // Create a ".gitignore"
+            let gitignore = create_gitignore(&repo, root)?;
+
+            // Create "ignored.txt" and confirm it's not ignored yet
+            let ignored_txt = create_file(root, "ignored.txt")?;
+            assert_not_ignored(&repo, &ignored_txt);
+
+            // Add "ignored.txt" to .gitignore -> now Git should ignore it
+            append_to_gitignore(&gitignore, "ignored.txt")?;
+            assert_ignored(&repo, &ignored_txt);
+
+            // Run collect_ignored_paths over the entire repo
+            let mut collected = Vec::new();
+            let ignored_paths = collect_ignored_paths(&repo, Path::new(""), &mut collected)?;
+
+            // We expect exactly 1 ignored path, and it should match `ignored_txt`.
+            assert_eq!(
+                ignored_paths.len(),
+                1,
+                "Expected exactly one ignored file, got {}",
+                ignored_paths.len()
+            );
+            assert_same_path(&ignored_paths[0], &ignored_txt);
+
+            Ok(())
+        }
+
+        // -----------------------------------------------------------------
+        // 3. When given a single file path, `collect_ignored_paths` should
+        //    return at most that file—even if there are other ignored files
+        //    in the same folder.
+        // -----------------------------------------------------------------
+        #[test]
+        fn only_specified_file_is_checked_for_ignore() -> Result<(), PickerError> {
+            let (temp_dir, repo) = init_repo_in_tempdir();
+            let root = temp_dir.path();
+
+            // 1) Create and touch a ".gitignore"
+            let gitignore = create_gitignore(&repo, root)?;
+
+            // 2) Create two files and add both to .gitignore
+            let ignored1 = create_file(root, "ignored.txt")?;
+            let ignored2 = create_file(root, "ignored2.txt")?;
+
+            // Files should not be ignored yet
+            assert_not_ignored(&repo, &ignored1);
+            assert_not_ignored(&repo, &ignored2);
+
+            append_to_gitignore(&gitignore, "ignored.txt")?;
+            append_to_gitignore(&gitignore, "ignored2.txt")?;
+
+            // Both should indeed be ignored
+            assert_ignored(&repo, &ignored1);
+            assert_ignored(&repo, &ignored2);
+
+            // 3) Now call collect_ignored_paths *only* on "ignored.txt"
+            let mut collected = Vec::new();
+            let result = collect_ignored_paths(&repo, Path::new("ignored.txt"), &mut collected)?;
+
+            // It must return exactly one path and that must be ignored1
+            assert_eq!(
+                result.len(),
+                1,
+                "Expected only `ignored.txt` to be returned, even though ignored2.txt also exists"
+            );
+            assert_same_path(&result[0], &ignored1);
 
             Ok(())
         }
