@@ -16,7 +16,8 @@
 // along with ignore-rm.  If not, see <https://www.gnu.org/licenses/>.
 
 use dialoguer::{Confirm, FuzzySelect, Input, theme::ColorfulTheme};
-use git2::{Repository, Status, StatusOptions};
+use git2::Repository;
+use std::process::Command;
 use std::{
     fs, io,
     path::{Path, PathBuf},
@@ -35,6 +36,8 @@ pub enum PickerError {
     DeleteError(PathBuf, #[source] std::io::Error),
     #[error("failed to StripPrefixError")]
     StripPrefixError(#[from] std::path::StripPrefixError),
+    #[error("path is not valid UTF-8")]
+    NonUtf8Path,
 }
 
 /// Opens a folder picker starting at `start` and returns the selected relative path.
@@ -203,63 +206,42 @@ pub fn wait_for_enter() -> Result<(), PickerError> {
     Ok(())
 }
 
-pub fn collect_ignored_paths<'a>(
-    repo: &Repository,
-    path_to_delete: &Path,
-    out: &'a mut Vec<PathBuf>,
-) -> Result<&'a Vec<PathBuf>, PickerError> {
-    // Detect submodules
-    for sub in repo.submodules()? {
-        if let Ok(sm_repo) = sub.open() {
-            // If the path_to_delete is inside a submodule:
-            if path_to_delete.starts_with(&sub.path()) {
-                println!(
-                    "Path to delete {} is inside submodule at {}",
-                    path_to_delete.display(),
-                    sub.path().display()
-                );
-                // Strip the submodule prefix to get the relative path:
-                let rel = path_to_delete
-                    .strip_prefix(sub.path())
-                    .expect("path_to_delete always starts with sub.path()");
-                // Recurse into that submodule with the relative path.
-                return collect_ignored_paths(&sm_repo, rel, out);
-            }
-            // If the submodule itself lies within the path_to_delete:
-            if sub.path().starts_with(&path_to_delete) {
-                println!(
-                    "Submodule at {} lies within path to delete {}",
-                    sub.path().display(),
-                    path_to_delete.display()
-                );
-                // Collect all of its ignored files.
-                collect_ignored_paths(&sm_repo, Path::new(""), out)?;
-            }
-        }
+pub fn collect_ignored_paths(path: &Path) -> Result<Vec<PathBuf>, PickerError> {
+    // If the path is empty (""), default to "."
+    let path = if path.as_os_str().is_empty() {
+        std::path::Path::new(".")
+    } else {
+        path
+    };
+
+    // Convert &Path -> &str, but catch non‐UTF8
+    let path_arg = path.to_str().ok_or(PickerError::NonUtf8Path)?;
+
+    let output = Command::new("git")
+        .args(&[
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "--",
+            path_arg,
+        ])
+        .output()?;
+
+    if !output.status.success() {
+        // If Git wrote UTF-8 to stderr, use it; otherwise, fall back on raw bytes:
+        let stderr_text = String::from_utf8_lossy(&output.stderr).to_string();
+        return Err(PickerError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("git command failed: {}", stderr_text),
+        )));
     }
 
-    // Configure StatusOptions to include ignored entries and recurse into untracked directories
-    println!(
-        "Obtaining ignored files from {}",
-        repo.working_dir().join(path_to_delete).display()
-    );
-    let mut opts = StatusOptions::new();
-    opts.include_ignored(true)
-        .recurse_ignored_dirs(true)
-        .recurse_untracked_dirs(true);
+    // Git’s stdout is newline‐separated paths (relative to CWD). Convert each to PathBuf.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let list: Vec<PathBuf> = stdout.lines().map(PathBuf::from).collect();
 
-    if !path_to_delete.to_str().unwrap_or("").is_empty() {
-        opts.disable_pathspec_match(true).pathspec(path_to_delete);
-    }
-
-    let statuses = repo.statuses(Some(&mut opts))?;
-    for entry in statuses.iter() {
-        if entry.status().contains(Status::IGNORED) {
-            if let Some(path) = entry.path() {
-                out.push(repo.working_dir().join(path));
-            }
-        }
-    }
-
-    Ok(out)
+    println!("{:?}", list);
+    Ok(list)
 }

@@ -19,7 +19,7 @@ use ignore_rm::{
     PickerError, RepositoryExt, collect_ignored_paths, confirm_delete_files, delete_paths,
     discover_topmost, pick_folder, wait_for_enter,
 };
-use std::{env, path::PathBuf};
+use std::env;
 
 fn main() -> Result<(), PickerError> {
     // Get the current directory
@@ -31,19 +31,18 @@ fn main() -> Result<(), PickerError> {
     println!("Path to delete temporary files: {:?}", selected_folder);
 
     // Obtain all the ignored paths from that path
-    let mut ignored_paths_tmp: Vec<PathBuf> = Vec::new();
-    let ignored_paths = collect_ignored_paths(&repo, &selected_folder, &mut ignored_paths_tmp)?;
+    let ignored_paths = collect_ignored_paths(&selected_folder)?;
 
     if !ignored_paths.is_empty() {
         // Print a header message before listing files
         println!("Files to be deleted:");
-        for path in ignored_paths {
+        for path in &ignored_paths {
             println!("   {}", path.display());
         }
 
         // Confirm deletion by user
         if confirm_delete_files() {
-            delete_paths(&repo.working_dir(), ignored_paths_tmp)?;
+            delete_paths(&repo.working_dir(), ignored_paths)?;
             println!("Deletion completed.");
         } else {
             println!("Aborted; no files were deleted.");
