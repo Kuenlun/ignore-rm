@@ -16,7 +16,8 @@
 // along with ignore-rm.  If not, see <https://www.gnu.org/licenses/>.
 
 use dialoguer::{Confirm, FuzzySelect, Input, theme::ColorfulTheme};
-use git2::{Repository, Status, StatusOptions};
+use git2::Repository;
+use std::process::Command;
 use std::{
     fs, io,
     path::{Path, PathBuf},
@@ -35,6 +36,8 @@ pub enum PickerError {
     DeleteError(PathBuf, #[source] std::io::Error),
     #[error("failed to StripPrefixError")]
     StripPrefixError(#[from] std::path::StripPrefixError),
+    #[error("path is not valid UTF-8")]
+    NonUtf8Path,
 }
 
 /// Opens a folder picker starting at `start` and returns the selected relative path.
@@ -203,63 +206,89 @@ pub fn wait_for_enter() -> Result<(), PickerError> {
     Ok(())
 }
 
-pub fn collect_ignored_paths<'a>(
-    repo: &Repository,
-    path_to_delete: &Path,
-    out: &'a mut Vec<PathBuf>,
-) -> Result<&'a Vec<PathBuf>, PickerError> {
-    // Detect submodules
-    for sub in repo.submodules()? {
-        if let Ok(sm_repo) = sub.open() {
-            // If the path_to_delete is inside a submodule:
-            if path_to_delete.starts_with(&sub.path()) {
-                println!(
-                    "Path to delete {} is inside submodule at {}",
-                    path_to_delete.display(),
-                    sub.path().display()
-                );
-                // Strip the submodule prefix to get the relative path:
-                let rel = path_to_delete
-                    .strip_prefix(sub.path())
-                    .expect("path_to_delete always starts with sub.path()");
-                // Recurse into that submodule with the relative path.
-                return collect_ignored_paths(&sm_repo, rel, out);
+/// Returns a Vec<PathBuf> containing each submodule’s path (relative to the repository root, as stored in .gitmodules)
+fn submodule_paths(repo_path: &Path) -> Result<Vec<PathBuf>, PickerError> {
+    // Open the repository at `repo_path`
+    let repo = Repository::open(repo_path)?;
+    // `repo.submodules()` returns a Vec<Submodule>
+    let subs = repo.submodules()?;
+    // Cada path de submódulo es relativo a la raíz del repo, así que lo unimos con repo_path
+    let paths = subs
+        .into_iter()
+        .map(|sm| repo_path.join(sm.path()))
+        .collect();
+    Ok(paths)
+}
+
+// Collects all ignored paths (files and directories) in a Git repository and its submodules.
+// - repo_path: Path to the root of the repository.
+// - rel_path: Relative path within the repository to search for ignored files.
+pub fn collect_ignored_paths(
+    repo_path: &Path,
+    rel_path: &Path,
+) -> Result<Vec<PathBuf>, PickerError> {
+    // If the path is empty (""), default to "."
+    let rel_path = if rel_path.as_os_str().is_empty() {
+        std::path::Path::new(".")
+    } else {
+        rel_path
+    };
+
+    let mut ignored_paths = Vec::new();
+
+    // Get submodule paths (if any)
+    let sub_paths = match submodule_paths(repo_path) {
+        Ok(paths) => paths,
+        Err(PickerError::Git2(ref e)) if e.code() == git2::ErrorCode::NotFound => {
+            // Submodule is not initialized
+            Vec::new()
+        }
+        Err(e) => return Err(e),
+    };
+
+    // Recursively collect ignored paths from submodules
+    for sub_path in &sub_paths {
+        match collect_ignored_paths(&sub_path, Path::new(".")) {
+            Ok(submodule_ignored) => ignored_paths.extend(submodule_ignored),
+            Err(PickerError::Git2(ref e)) if e.code() == git2::ErrorCode::NotFound => {
+                // Submodule not initialized, skip
+                continue;
             }
-            // If the submodule itself lies within the path_to_delete:
-            if sub.path().starts_with(&path_to_delete) {
-                println!(
-                    "Submodule at {} lies within path to delete {}",
-                    sub.path().display(),
-                    path_to_delete.display()
-                );
-                // Collect all of its ignored files.
-                collect_ignored_paths(&sm_repo, Path::new(""), out)?;
-            }
+            Err(e) => return Err(e),
         }
     }
 
-    // Configure StatusOptions to include ignored entries and recurse into untracked directories
-    println!(
-        "Obtaining ignored files from {}",
-        repo.working_dir().join(path_to_delete).display()
-    );
-    let mut opts = StatusOptions::new();
-    opts.include_ignored(true)
-        .recurse_ignored_dirs(true)
-        .recurse_untracked_dirs(true);
+    // Convert rel_path to &str, error if not valid UTF-8
+    let path_arg = rel_path.to_str().ok_or(PickerError::NonUtf8Path)?;
 
-    if !path_to_delete.to_str().unwrap_or("").is_empty() {
-        opts.disable_pathspec_match(true).pathspec(path_to_delete);
+    // Run the git command to list ignored files and directories
+    let output = Command::new("git")
+        .current_dir(repo_path)
+        .args(&[
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "--",
+            path_arg,
+        ])
+        .output()?;
+
+    if !output.status.success() {
+        let stderr_text = String::from_utf8_lossy(&output.stderr).to_string();
+        return Err(PickerError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("git command failed: {}", stderr_text),
+        )));
     }
 
-    let statuses = repo.statuses(Some(&mut opts))?;
-    for entry in statuses.iter() {
-        if entry.status().contains(Status::IGNORED) {
-            if let Some(path) = entry.path() {
-                out.push(repo.working_dir().join(path));
-            }
-        }
-    }
+    // Parse the output: each line is a path relative to repo_path
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let list: Vec<PathBuf> = stdout.lines().map(|line| repo_path.join(line)).collect();
 
-    Ok(out)
+    // Add found paths to the result
+    ignored_paths.extend(list);
+
+    Ok(ignored_paths)
 }
