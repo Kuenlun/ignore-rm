@@ -292,3 +292,364 @@ pub fn collect_ignored_paths(
 
     Ok(ignored_paths)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---------------------------------------------------------------------
+    // Helpers for tests
+    // ---------------------------------------------------------------------
+
+    /// Assert that two paths are equal after canonicalization.
+    fn assert_same_path(p1: &Path, p2: &Path) {
+        let err_msg = "failed to canonicalize";
+        let c1 = p1.canonicalize().expect(err_msg);
+        let c2 = p2.canonicalize().expect(err_msg);
+        assert_eq!(c1, c2);
+    }
+
+    /// Initialize a repository and assert its working_dir matches the given path
+    fn init_repo_assert_path_matches(path: &Path) -> Repository {
+        let repo = Repository::init(path).expect("failed to init repo");
+        assert_same_path(repo.working_dir(), path);
+        repo
+    }
+
+    /// Create a temporary Git repository and return the TempDir and Repository handle
+    fn init_repo_in_tempdir() -> (tempfile::TempDir, Repository) {
+        let temp = tempfile::tempdir().expect("failed to create tempdir");
+        let repo = init_repo_assert_path_matches(temp.path());
+        (temp, repo)
+    }
+
+    // ---------------------------------------------------------------------
+    // `collect_ignored_paths` tests
+    // ---------------------------------------------------------------------
+    mod collect_ignored_paths {
+        use super::*;
+        use std::io::Write;
+
+        // Creates an empty `.gitignore` file in `dir`, then asserts that Git does not ignore it.
+        fn create_gitignore(repo: &Repository, dir: &Path) -> Result<PathBuf, PickerError> {
+            let gitignore_path = dir.join(".gitignore");
+            fs::File::create(&gitignore_path)?;
+
+            // Ensure that Git is not already ignoring ".gitignore" itself
+            let is_ignored = repo.is_path_ignored(Path::new(".gitignore"))?;
+            assert!(!is_ignored, ".gitignore should not be ignored by default");
+
+            Ok(gitignore_path)
+        }
+
+        // Creates a file named `filename` inside `dir`. Returns its full PathBuf.
+        fn create_file(dir: &Path, filename: &str) -> Result<PathBuf, PickerError> {
+            let full_path = dir.join(filename);
+            fs::File::create(&full_path)?;
+            Ok(full_path)
+        }
+
+        // Appends exactly `pattern` (plus a newline) to the given `.gitignore` file.
+        fn append_to_gitignore(gitignore: &Path, pattern: &str) -> Result<(), PickerError> {
+            let mut file = fs::OpenOptions::new().append(true).open(gitignore)?;
+            writeln!(file, "{}", pattern)?;
+            Ok(())
+        }
+
+        // Panics if `path` is not ignored by Git.
+        fn assert_ignored(repo: &Repository, path: &Path) {
+            let ignored = repo
+                .is_path_ignored(path)
+                .unwrap_or_else(|e| panic!("Git error checking `{}`: {}", path.display(), e));
+            assert!(
+                ignored,
+                "`{}` should be ignored according to .gitignore",
+                path.display()
+            );
+        }
+
+        // Panics if `path` is ignored by Git.
+        fn assert_not_ignored(repo: &Repository, path: &Path) {
+            let ignored = repo
+                .is_path_ignored(path)
+                .unwrap_or_else(|e| panic!("Git error checking `{}`: {}", path.display(), e));
+            assert!(
+                !ignored,
+                "`{}` should NOT be ignored according to .gitignore",
+                path.display()
+            );
+        }
+
+        // ----------------------------------------------------------------------
+        // 1. No ignored-file at all -> `collect_ignored_paths` returns empty vec
+        // ----------------------------------------------------------------------
+        #[test]
+        fn no_ignored_file_returns_empty() -> Result<(), PickerError> {
+            let (temp_dir, repo) = init_repo_in_tempdir();
+            let root = temp_dir.path();
+
+            // Create a file "not_ignored.txt" at repo root
+            let not_ignored = create_file(root, "not_ignored.txt")?;
+            // Assert Git does not ignore it
+            assert_not_ignored(&repo, &not_ignored);
+
+            // Collect ignored paths from the entire repo ("" = root)
+            let ignored_paths = collect_ignored_paths(&root, Path::new(""))?;
+
+            // We expect zero ignored-paths
+            assert!(
+                ignored_paths.is_empty(),
+                "Expected no ignored paths, but found some: {:?}",
+                ignored_paths
+            );
+
+            Ok(())
+        }
+
+        // ------------------------------------------------------------------------
+        // 2. One ignored-file -> `collect_ignored_paths` returns exactly that file
+        // ------------------------------------------------------------------------
+        #[test]
+        fn single_ignored_file_is_detected() -> Result<(), PickerError> {
+            let (temp_dir, repo) = init_repo_in_tempdir();
+            let root = temp_dir.path();
+
+            // Create a ".gitignore"
+            let gitignore = create_gitignore(&repo, root)?;
+
+            // Create "ignored.txt" and confirm it's not ignored yet
+            let ignored_txt = create_file(root, "ignored.txt")?;
+            assert_not_ignored(&repo, &ignored_txt);
+
+            // Add "ignored.txt" to .gitignore -> now Git should ignore it
+            append_to_gitignore(&gitignore, "ignored.txt")?;
+            assert_ignored(&repo, &ignored_txt);
+
+            // Run collect_ignored_paths over the entire repo
+            let ignored_paths = collect_ignored_paths(&root, Path::new(""))?;
+
+            // We expect exactly 1 ignored path, and it should match `ignored_txt`.
+            assert_eq!(
+                ignored_paths.len(),
+                1,
+                "Expected exactly one ignored file, got {}",
+                ignored_paths.len()
+            );
+            assert_same_path(&ignored_paths[0], &ignored_txt);
+
+            Ok(())
+        }
+
+        // -----------------------------------------------------------------
+        // 3. When given a single file path, `collect_ignored_paths` should
+        //    return at most that file, even if there are other ignored files
+        //    in the same folder.
+        // -----------------------------------------------------------------
+        #[test]
+        fn only_specified_file_is_checked_for_ignore() -> Result<(), PickerError> {
+            let (temp_dir, repo) = init_repo_in_tempdir();
+            let root = temp_dir.path();
+
+            // Create a ".gitignore"
+            let gitignore = create_gitignore(&repo, root)?;
+
+            // Create two files and add both to .gitignore
+            let ignored1 = create_file(root, "ignored.txt")?;
+            let ignored2 = create_file(root, "ignored2.txt")?;
+
+            // Files should not be ignored yet
+            assert_not_ignored(&repo, &ignored1);
+            assert_not_ignored(&repo, &ignored2);
+
+            append_to_gitignore(&gitignore, "ignored.txt")?;
+            append_to_gitignore(&gitignore, "ignored2.txt")?;
+
+            // Both should indeed be ignored
+            assert_ignored(&repo, &ignored1);
+            assert_ignored(&repo, &ignored2);
+
+            // Now call collect_ignored_paths *only* on "ignored.txt"
+            let result = collect_ignored_paths(&root, Path::new("ignored.txt"))?;
+
+            // It must return exactly one path and that must be ignored1
+            assert_eq!(
+                result.len(),
+                1,
+                "Expected only `ignored.txt` to be returned, even though ignored2.txt also exists"
+            );
+            assert_same_path(&result[0], &ignored1);
+
+            Ok(())
+        }
+
+        // ----------------------------------------------------------------------
+        // 4. Ignored directory -> only the ignored directory itself should be collected,
+        //    not its internal files.
+        // ----------------------------------------------------------------------
+        #[test]
+        fn ignored_directory_and_contents_are_collected() -> Result<(), PickerError> {
+            let (temp_dir, repo) = init_repo_in_tempdir();
+            let root = temp_dir.path();
+
+            // Create a ".gitignore"
+            let gitignore = create_gitignore(&repo, root)?;
+
+            // Create an ignored directory "ignored_dir" with a file inside
+            let ignored_dir = root.join("ignored_dir");
+            fs::create_dir(&ignored_dir)?;
+            let ignored_file = create_file(&ignored_dir, "file.txt")?;
+            assert_not_ignored(&repo, &ignored_file);
+            assert_not_ignored(&repo, &ignored_dir);
+
+            // Add the directory to .gitignore
+            append_to_gitignore(&gitignore, "ignored_dir/")?;
+            assert_ignored(&repo, &ignored_file);
+            assert_ignored(&repo, &ignored_dir);
+
+            // Collect ignored paths from the ignored directory
+            let ignored_paths = collect_ignored_paths(&root, Path::new("ignored_dir"))?;
+
+            // The only collected path should be the directory
+            assert_eq!(ignored_paths.len(), 1);
+            assert_same_path(&ignored_paths[0], &ignored_dir);
+
+            Ok(())
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // `discover_topmost` tests
+    // ---------------------------------------------------------------------
+    mod discover_topmost {
+        use super::*;
+        use tempfile::tempdir;
+
+        /// Assert that `discover_topmost(path)` returns the expected repository.
+        fn assert_finds_topmost(path: &Path, expected: &Repository) {
+            let found = discover_topmost(path).expect("discover_topmost failed");
+
+            // Compare working directories
+            assert_same_path(found.working_dir(), expected.working_dir());
+
+            // Compare repository paths
+            assert_same_path(found.path(), expected.path());
+        }
+
+        // Test that discovering from the repo root returns the repo itself
+        #[test]
+        fn discover_topmost_from_root_returns_root() -> Result<(), PickerError> {
+            let (temp, top_repo) = init_repo_in_tempdir();
+            let root = temp.path();
+
+            assert_finds_topmost(&root, &top_repo);
+            Ok(())
+        }
+
+        // Test that discovering from a repo subdirectory returns the repo itself
+        #[test]
+        fn discover_topmost_from_subdirectory_returns_root() -> Result<(), PickerError> {
+            let (temp, top_repo) = init_repo_in_tempdir();
+            let root = temp.path();
+
+            // Create a nested directory inside the repo
+            let sub_dir = root.join("a");
+            fs::create_dir_all(&sub_dir)?;
+
+            assert_finds_topmost(&sub_dir, &top_repo);
+            Ok(())
+        }
+
+        // Test that discovering from a repo nested subdirectory returns the repo itself
+        #[test]
+        fn discover_topmost_from_nested_subdirectory_returns_root() -> Result<(), PickerError> {
+            let (temp, top_repo) = init_repo_in_tempdir();
+            let root = temp.path();
+
+            // Create a nested directory inside the repo
+            let nested_sub_dir = root.join("a").join("b");
+            fs::create_dir_all(&nested_sub_dir)?;
+
+            assert_finds_topmost(&nested_sub_dir, &top_repo);
+            Ok(())
+        }
+
+        #[test]
+        fn discover_topmost_from_sub_repo_returns_root() -> Result<(), PickerError> {
+            let (temp, top_repo) = init_repo_in_tempdir();
+            let root = temp.path();
+
+            // Create a nested directory inside the repo
+            let sub_dir = root.join("a");
+            fs::create_dir_all(&sub_dir)?;
+
+            // Init a repo at the subdirectory
+            init_repo_assert_path_matches(&sub_dir);
+
+            assert_finds_topmost(&sub_dir, &top_repo);
+            Ok(())
+        }
+
+        #[test]
+        fn discover_topmost_from_nested_repo_in_sub_directory_returns_root()
+        -> Result<(), PickerError> {
+            let (temp, top_repo) = init_repo_in_tempdir();
+            let root = temp.path();
+
+            // Create a nested directory inside the repo
+            let nested_sub_dir = root.join("a").join("b");
+            fs::create_dir_all(&nested_sub_dir)?;
+
+            // Init a repo at the nested subdirectory
+            init_repo_assert_path_matches(&nested_sub_dir);
+
+            assert_finds_topmost(&nested_sub_dir, &top_repo);
+            Ok(())
+        }
+
+        #[test]
+        fn discover_topmost_from_nested_sub_repo_returns_root() -> Result<(), PickerError> {
+            let (temp, top_repo) = init_repo_in_tempdir();
+            let root = temp.path();
+
+            // Create a subdirectory inside the repo
+            let sub_dir = root.join("a");
+            fs::create_dir_all(&sub_dir)?;
+
+            // Create a nested directory inside the repo
+            let nested_sub_dir = sub_dir.join("b");
+            fs::create_dir_all(&nested_sub_dir)?;
+
+            // Init a repo at the subdirectory
+            init_repo_assert_path_matches(&sub_dir);
+            // Init a repo at the nested subdirectory
+            init_repo_assert_path_matches(&nested_sub_dir);
+
+            assert_finds_topmost(&nested_sub_dir, &top_repo);
+            Ok(())
+        }
+
+        #[test]
+        fn discover_topmost_error_when_no_repo() -> Result<(), PickerError> {
+            let temp = tempdir()?;
+            let root = temp.path();
+
+            // Call the function and expect a specific Git2 error
+            let Err(PickerError::Git2(e)) = discover_topmost(&root) else {
+                panic!("expected Err(PickerError::Git2) with NotFound");
+            };
+
+            // Check that libgit2 correctly identifies the error class and code
+            assert_eq!(
+                e.class(),
+                git2::ErrorClass::Repository,
+                "expected libgit2 error class Repository"
+            );
+            assert_eq!(
+                e.code(),
+                git2::ErrorCode::NotFound,
+                "expected libgit2 error code NotFound"
+            );
+            Ok(())
+        }
+    }
+}
