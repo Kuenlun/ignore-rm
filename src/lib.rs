@@ -206,18 +206,64 @@ pub fn wait_for_enter() -> Result<(), PickerError> {
     Ok(())
 }
 
-pub fn collect_ignored_paths(path: &Path) -> Result<Vec<PathBuf>, PickerError> {
+/// Returns a Vec<PathBuf> containing each submodule’s path (relative to the repository root, as stored in .gitmodules)
+fn submodule_paths(repo_path: &Path) -> Result<Vec<PathBuf>, PickerError> {
+    // Open the repository at `repo_path`
+    let repo = Repository::open(repo_path)?;
+    // `repo.submodules()` returns a Vec<Submodule>
+    let subs = repo.submodules()?;
+    // Cada path de submódulo es relativo a la raíz del repo, así que lo unimos con repo_path
+    let paths = subs
+        .into_iter()
+        .map(|sm| repo_path.join(sm.path()))
+        .collect();
+    Ok(paths)
+}
+
+// Collects all ignored paths (files and directories) in a Git repository and its submodules.
+// - repo_path: Path to the root of the repository.
+// - rel_path: Relative path within the repository to search for ignored files.
+pub fn collect_ignored_paths(
+    repo_path: &Path,
+    rel_path: &Path,
+) -> Result<Vec<PathBuf>, PickerError> {
     // If the path is empty (""), default to "."
-    let path = if path.as_os_str().is_empty() {
+    let rel_path = if rel_path.as_os_str().is_empty() {
         std::path::Path::new(".")
     } else {
-        path
+        rel_path
     };
 
-    // Convert &Path -> &str, but catch non‐UTF8
-    let path_arg = path.to_str().ok_or(PickerError::NonUtf8Path)?;
+    let mut ignored_paths = Vec::new();
 
+    // Get submodule paths (if any)
+    let sub_paths = match submodule_paths(repo_path) {
+        Ok(paths) => paths,
+        Err(PickerError::Git2(ref e)) if e.code() == git2::ErrorCode::NotFound => {
+            // Submodule is not initialized
+            Vec::new()
+        }
+        Err(e) => return Err(e),
+    };
+
+    // Recursively collect ignored paths from submodules
+    for sub_path in &sub_paths {
+        match collect_ignored_paths(&sub_path, Path::new(".")) {
+            Ok(submodule_ignored) => ignored_paths.extend(submodule_ignored),
+            Err(PickerError::Git2(ref e)) if e.code() == git2::ErrorCode::NotFound => {
+                // Submodule not initialized, skip
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    // Convert rel_path to &str, error if not valid UTF-8
+    let path_arg = rel_path.to_str().ok_or(PickerError::NonUtf8Path)?;
+
+    // Run the git command to list ignored files and directories
     let output = Command::new("git")
+        .current_dir(repo_path)
         .args(&[
             "ls-files",
             "--others",
@@ -230,7 +276,6 @@ pub fn collect_ignored_paths(path: &Path) -> Result<Vec<PathBuf>, PickerError> {
         .output()?;
 
     if !output.status.success() {
-        // If Git wrote UTF-8 to stderr, use it; otherwise, fall back on raw bytes:
         let stderr_text = String::from_utf8_lossy(&output.stderr).to_string();
         return Err(PickerError::Io(std::io::Error::new(
             std::io::ErrorKind::Other,
@@ -238,10 +283,12 @@ pub fn collect_ignored_paths(path: &Path) -> Result<Vec<PathBuf>, PickerError> {
         )));
     }
 
-    // Git’s stdout is newline‐separated paths (relative to CWD). Convert each to PathBuf.
+    // Parse the output: each line is a path relative to repo_path
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let list: Vec<PathBuf> = stdout.lines().map(PathBuf::from).collect();
+    let list: Vec<PathBuf> = stdout.lines().map(|line| repo_path.join(line)).collect();
 
-    println!("{:?}", list);
-    Ok(list)
+    // Add found paths to the result
+    ignored_paths.extend(list);
+
+    Ok(ignored_paths)
 }
