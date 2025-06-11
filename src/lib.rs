@@ -206,25 +206,28 @@ pub fn wait_for_enter() -> Result<(), PickerError> {
     Ok(())
 }
 
-/// Returns a Vec<PathBuf> containing each submodule’s path (relative to the repository root, as stored in .gitmodules)
-fn submodule_paths(repo_path: &Path) -> Result<Vec<PathBuf>, PickerError> {
-    // Open the repository at `repo_path`
-    let repo = Repository::open(repo_path)?;
-    // `repo.submodules()` returns a Vec<Submodule>
-    let subs = repo.submodules()?;
-    // Cada path de submódulo es relativo a la raíz del repo, así que lo unimos con repo_path
-    let paths = subs
-        .into_iter()
-        .map(|sm| repo_path.join(sm.path()))
-        .collect();
-    Ok(paths)
+/// Returns a Vec<Repository> for each initialized submodule in the given repository.
+/// Skips submodules that are not initialized (i.e., cannot be opened).
+fn get_submodules(repo: &Repository) -> Result<Vec<Repository>, PickerError> {
+    let mut sub_repos = Vec::new();
+    for sub in repo.submodules()? {
+        match sub.open() {
+            Ok(sub_repo) => sub_repos.push(sub_repo),
+            Err(e) if e.code() == git2::ErrorCode::NotFound => {
+                // Submodule not initialized, skip
+                continue;
+            }
+            Err(e) => return Err(PickerError::Git2(e)),
+        }
+    }
+    Ok(sub_repos)
 }
 
 // Collects all ignored paths (files and directories) in a Git repository and its submodules.
 // - repo_path: Path to the root of the repository.
 // - rel_path: Relative path within the repository to search for ignored files.
 pub fn collect_ignored_paths(
-    repo_path: &Path,
+    repo: &Repository,
     rel_path: &Path,
 ) -> Result<Vec<PathBuf>, PickerError> {
     // If the path is empty (""), default to "."
@@ -236,19 +239,9 @@ pub fn collect_ignored_paths(
 
     let mut ignored_paths = Vec::new();
 
-    // Get submodule paths (if any)
-    let sub_paths = match submodule_paths(repo_path) {
-        Ok(paths) => paths,
-        Err(PickerError::Git2(ref e)) if e.code() == git2::ErrorCode::NotFound => {
-            // Submodule is not initialized
-            Vec::new()
-        }
-        Err(e) => return Err(e),
-    };
-
     // Recursively collect ignored paths from submodules
-    for sub_path in &sub_paths {
-        match collect_ignored_paths(&sub_path, Path::new(".")) {
+    for submodule in get_submodules(repo)? {
+        match collect_ignored_paths(&submodule, Path::new(".")) {
             Ok(submodule_ignored) => ignored_paths.extend(submodule_ignored),
             Err(PickerError::Git2(ref e)) if e.code() == git2::ErrorCode::NotFound => {
                 // Submodule not initialized, skip
@@ -263,7 +256,7 @@ pub fn collect_ignored_paths(
 
     // Run the git command to list ignored files and directories
     let output = Command::new("git")
-        .current_dir(repo_path)
+        .current_dir(repo.working_dir())
         .args(&[
             "ls-files",
             "--others",
@@ -283,9 +276,12 @@ pub fn collect_ignored_paths(
         )));
     }
 
-    // Parse the output: each line is a path relative to repo_path
+    // Parse the output: each line is a path relative to the repo path
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let list: Vec<PathBuf> = stdout.lines().map(|line| repo_path.join(line)).collect();
+    let list: Vec<PathBuf> = stdout
+        .lines()
+        .map(|line| repo.working_dir().join(line))
+        .collect();
 
     // Add found paths to the result
     ignored_paths.extend(list);

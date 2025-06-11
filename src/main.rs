@@ -31,7 +31,7 @@ fn main() -> Result<(), PickerError> {
     println!("Path to delete temporary files: {:?}", selected_folder);
 
     // Obtain all the ignored paths from that path
-    let ignored_paths = collect_ignored_paths(&repo.working_dir(), &selected_folder)?;
+    let ignored_paths = collect_ignored_paths(&repo, &selected_folder)?;
 
     if !ignored_paths.is_empty() {
         // Print a header message before listing files
