@@ -238,16 +238,28 @@ pub fn collect_ignored_paths(
     };
 
     let mut ignored_paths = Vec::new();
+    let repo_workdir = repo.working_dir();
 
-    // Recursively collect ignored paths from submodules
+    // Recursively collect ignored directories and files from submodules
     for submodule in get_submodules(repo)? {
-        match collect_ignored_paths(&submodule, Path::new(".")) {
-            Ok(submodule_ignored) => ignored_paths.extend(submodule_ignored),
-            Err(PickerError::Git2(ref e)) if e.code() == git2::ErrorCode::NotFound => {
-                // Submodule not initialized, skip
-                continue;
-            }
-            Err(e) => return Err(e),
+        let sub_path = submodule.working_dir();
+
+        // Compute the submodule's path relative to the parent repo
+        let sub_rel = sub_path.strip_prefix(repo_workdir)?;
+
+        // If rel_path is inside a submodule, only recurse into that submodule
+        if rel_path.starts_with(sub_rel) {
+            // rel_path is inside this submodule
+            let rel_in_sub = rel_path.strip_prefix(sub_rel)?;
+            // Return the ignored files/dirs from this submodule, no need to recurse further
+            return collect_ignored_paths(&submodule, rel_in_sub);
+        }
+
+        // If a submodule lies within rel_path, collect ignored paths from that submodule as well
+        if sub_rel.starts_with(rel_path) || rel_path == Path::new(".") {
+            // Collect all ignored paths in submodule and continue if there are more submodules
+            let sub_ignored = collect_ignored_paths(&submodule, Path::new("."))?;
+            ignored_paths.extend(sub_ignored);
         }
     }
 
@@ -256,7 +268,7 @@ pub fn collect_ignored_paths(
 
     // Run the git command to list ignored files and directories
     let output = Command::new("git")
-        .current_dir(repo.working_dir())
+        .current_dir(repo_workdir)
         .args(&[
             "ls-files",
             "--others",
@@ -278,10 +290,7 @@ pub fn collect_ignored_paths(
 
     // Parse the output: each line is a path relative to the repo path
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let list: Vec<PathBuf> = stdout
-        .lines()
-        .map(|line| repo.working_dir().join(line))
-        .collect();
+    let list: Vec<PathBuf> = stdout.lines().map(|line| repo_workdir.join(line)).collect();
 
     // Add found paths to the result
     ignored_paths.extend(list);
